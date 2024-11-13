@@ -15,6 +15,8 @@ from optparse import OptionParser
 from ZZAnalysis.AnalysisStep.eostools import *
 from ZZAnalysis.AnalysisStep.readSampleInfo import *
 
+if(sys.version_info.major < 3):
+    input = raw_input
 
 def chunks(l, n):
     return [l[i:i+n] for i in range(0, len(l), n)]
@@ -51,10 +53,16 @@ def batchScript( index, remoteDir=''):
 #Note: ${VAR} in the script have to be escaped as ${{VAR}}
 # as the string is parsed through .format
    script = """#!/bin/bash
-set -euo pipefail
-
 SUBMIT_DIR=$1
 TRANSFER_DIR={remoteDir}
+
+uname -srm
+
+# CMS env needs to be set manually in al9
+export VO_CMS_SW_DIR=/cvmfs/cms.cern.ch
+source $VO_CMS_SW_DIR/cmsset_default.sh 
+
+set -euo pipefail
 
 cd $SUBMIT_DIR
 eval $(scram ru -sh)
@@ -70,15 +78,20 @@ cmsRunStatus=   #default for successful completion is an empty file
 cmsRun run_cfg.py |& grep -v -e 'MINUIT WARNING' -e 'Second derivative zero' -e 'Negative diagonal element' -e 'added to diagonal of error matrix' > log.txt || cmsRunStatus=$?
 
 echo -n $cmsRunStatus > exitStatus.txt
-echo 'cmsRun done at: ' $(date) with exit status: ${{cmsRunStatus+0}}
+if [ -z $cmsRunStatus ]; then cmsRunStatus=0; fi
+echo 'cmsRun done at: ' $(date) with exit status: $cmsRunStatus
 gzip log.txt
+
+set +euo pipefail
 
 export ROOT_HIST=0
 if [ -s ZZ4lAnalysis.root ]; then
  root -q -b '${{CMSSW_BASE}}/src/ZZAnalysis/AnalysisStep/test/prod/rootFileIntegrity.r("ZZ4lAnalysis.root")'
-else
- echo moving empty file
+elif [ -f  ZZ4lAnalysis.root ]; then
+ echo moving away empty ZZ4lAnalysis.root file
  mv ZZ4lAnalysis.root ZZ4lAnalysis.root.empty
+else
+ echo ERROR: ZZ4lAnalysis.root file is missing
 fi
 
 echo "Files on node:"
@@ -113,10 +126,16 @@ exit $cmsRunStatus
 def batchScriptNano( index, remoteDir=''):
    '''prepare the Condor version of the batch script, to run on HTCondor'''
    script = '''#!/bin/bash
-set -euo pipefail
-
 SUBMIT_DIR=$1
 TRANSFER_DIR={remoteDir}
+
+uname -srm
+
+# CMS env needs to be set manually in al9
+export VO_CMS_SW_DIR=/cvmfs/cms.cern.ch
+source $VO_CMS_SW_DIR/cmsset_default.sh 
+
+set -euo pipefail
 
 cd $SUBMIT_DIR
 eval $(scram ru -sh)
@@ -132,15 +151,20 @@ exitStatus=   #default for successful completion is an empty file
 python run_cfg.py >& log.txt || exitStatus=$?
 
 echo -n $exitStatus > exitStatus.txt
-echo 'job done at: ' $(date) with exit status: ${{exitStatus+0}}
+if [ -z $exitStatus ]; then exitStatus=0; fi
+echo 'job done at: ' $(date) with exit status: $exitStatus
 gzip log.txt
+
+set +euo pipefail
 
 export ROOT_HIST=0
 if [ -s ZZ4lAnalysis.root ]; then
  root -q -b '${{CMSSW_BASE}}/src/ZZAnalysis/AnalysisStep/test/prod/rootFileIntegrity.r("ZZ4lAnalysis.root")'
-else
- echo moving empty file
+elif [ -f  ZZ4lAnalysis.root ]; then
+ echo moving away empty ZZ4lAnalysis.root file
  mv ZZ4lAnalysis.root ZZ4lAnalysis.root.empty
+else
+ echo ERROR: ZZ4lAnalysis.root file is missing
 fi
 
 echo "Files on node:"
@@ -186,10 +210,10 @@ output                  = log/$(ClusterId).$(ProcId).out
 error                   = log/$(ClusterId).$(ProcId).err
 log                     = log/$(ClusterId).log
 Initialdir              = $(directory)
-request_memory          = '''+str(batchManager.options_.jobmem)+'''
+request_memory          = '''+str(batchManager.jobmem)+'''
 #Possible values: longlunch, workday, tomorrow, etc.; cf. https://batchdocs.web.cern.ch/local/submit.html
-+JobFlavour             = "'''+batchManager.options_.jobflavour+'''"
-
++JobFlavour             = "'''+batchManager.jobflavour+'''"
+{requirements}
 x509userproxy           = {home}/x509up_u{uid}
 
 #cf. https://www-auth.cs.wisc.edu/lists/htcondor-users/2010-September/msg00009.shtml
@@ -201,7 +225,17 @@ periodic_remove         = JobStatus == 5
        transfer=''
    else:
        transfer='transfer_output_files   = ""'       
-   return script.format(home=os.path.expanduser("~"), uid=os.getuid(), mainDir=mainDir, transfer=transfer)
+
+   release=open('/etc/redhat-release','r').read()
+   req = ""
+   if "release 7" in release:
+       req = "MY.SingularityImage = \"/cvmfs/unpacked.cern.ch/gitlab-registry.cern.ch/cms-cat/cmssw-lxplus/cmssw-el7-lxplus:latest/\""
+   elif "release 8" in release: #use a Singularity container
+       req = "MY.WantOS = \"el8\""
+   elif "release 9" in release:
+       req = "requirements = (OpSysAndVer =?= \"AlmaLinux9\")"    
+
+   return script.format(home=os.path.expanduser("~"), uid=os.getuid(), mainDir=mainDir, transfer=transfer, requirements=req)
 
             
 class MyBatchManager:
@@ -223,12 +257,12 @@ class MyBatchManager:
                                 help="create jobs, but does not submit the jobs.")
 
         self.parser_.add_option("-q", "--queue", dest="jobflavour",
-                                help="Max duration (the shorter, the quicker the job will start.Default: tomorrow = 1d; use  microcentury or longlunch for quick jobs. Cf. https://batchdocs.web.cern.ch/local/submit.html",
-                                default="tomorrow")
+                                help="Max duration (the shorter, the quicker the job will start.Default: 'tomorrow' for mini; 'longlunch' for nano.  Cf. https://batchdocs.web.cern.ch/local/submit.html",
+                                default=None) # default set below
 
         self.parser_.add_option("-m", "--mem", dest="jobmem",
                                 help="Requested memory (smaller = more nodes available ). Use 0 for no request",
-                                default="4000M")
+                                default=None)# default set below
 
         self.parser_.add_option("-p", "--pdf", dest="PDFstep",
                                 help="Step of PDF systematic uncertainty evaluation. It could be 1 or 2.",
@@ -275,11 +309,11 @@ class MyBatchManager:
         self.outputDir_ = os.path.abspath(outputDir)
         self.workingDir = str(self.outputDir_)
         if( os.path.isdir(self.outputDir_) == True ):
-            input = ''
+            inputyn = ''
             if not self.options_.force:
-                while input != 'y' and input != 'n':
-                    input = raw_input( 'The directory ' + self.outputDir_ + ' exists. Are you sure you want to continue? its contents will be overwritten [y/n] ' )
-            if input == 'n':
+                while inputyn != 'y' and inputyn != 'n':
+                    inputyn = input( 'The directory ' + self.outputDir_ + ' exists. Are you sure you want to continue? its contents will be overwritten [y/n] ' )
+            if inputyn == 'n':
                 sys.exit(1)
             else:
                 os.system( 'rm -rf ' + self.outputDir_)
@@ -308,7 +342,10 @@ class MyBatchManager:
                 sys.exit(4)
             #Create a link to transfer folder
             ret = os.system('ln -s ' + self.eosTransferPath + " " + self.outputDir_ + "/transferPath")
-            
+
+        # Default values for the following are set later, depending on mini/nano
+        self.jobmem = None 
+        self.jobflavour = None 
 
     def mkdir( self, dirname ):
        mkdir = 'mkdir -p %s' % dirname
@@ -346,10 +383,28 @@ class MyBatchManager:
        '''
        print('---PrepareJob N: ', value,  ' name: ', dirname)
 
-       inputType="miniAOD"
-       if "NANOAOD" in (splitComponents[value].files)[0] :
-           inputType="nanoAOD"
+       # Set requirements
+       inputType='miniAOD'
+       if 'nanoaod' in (splitComponents[value].files)[0].lower() :
+           inputType='nanoAOD'
+       if self.jobmem == None:
+           if batchManager.options_.jobmem != None :
+               self.jobmem = batchManager.options_.jobmem
+           else :
+               if inputType == 'miniAOD' :
+                   self.jobmem = '4000M'
+               else :
+                   self.jobmem = '3000M'
 
+       if self.jobflavour == None:
+           if batchManager.options_.jobflavour != None:
+               self.jobflavour = batchManager.options_.jobflavour
+           else :
+               if inputType == 'miniAOD' :
+                   self.jobflavour = 'tomorrow'
+               else :
+                   self.jobflavour = 'tomorrow'
+           
        dname = dirname
        if dname  is None:
            dname = 'Job_{value}'.format( value=value )
@@ -374,26 +429,26 @@ class MyBatchManager:
         os.system('chmod +x %s' % scriptFileName)
         template_name = splitComponents[value].samplename + 'run_template_cfg.py'
 
-#	working_dir = os.path.dirname(self.outputDir_)
+#       working_dir = os.path.dirname(self.outputDir_)
 
 
-	template_file_name = '%s/%s'%(self.outputDir_, template_name) #splitComponents[value].samplename + '_run_template_cfg.py' 
+        template_file_name = '%s/%s'%(self.outputDir_, template_name) #splitComponents[value].samplename + '_run_template_cfg.py' 
 #        shutil.copyfile(template_file_name, '%s/run_cfg.py'%jobDir)  
         new_job_path = '%s/run_cfg.py'%jobDir
-	files = splitComponents[value].files 
-	files = ["'%s'"%f for f in files]
-	files = ', '.join(files)
-	with open(new_job_path, 'w') as new_job_cfg :
-	    with open(template_file_name) as f:
-	        for line in f :
-		    if line.find('REPLACE')  > 1 :
+        files = splitComponents[value].files 
+        files = ["'%s'"%f for f in files]
+        files = ', '.join(files)
+        with open(new_job_path, 'w') as new_job_cfg :
+            with open(template_file_name) as f:
+                for line in f :
+                    if line.find('REPLACE')  > 1 :
                         actual_source_string = ""
                         if inputType=="miniAOD" :
                             actual_source_string = "fileNames = cms.untracked.vstring(%s),\n"%files
                         elif inputType=="nanoAOD" :
                             actual_source_string = 'setConf("fileNames",%s)\n'%splitComponents[value].files
-        	        line = actual_source_string
-		    new_job_cfg.write(line)
+                        line = actual_source_string
+                    new_job_cfg.write(line)
  
     def PrepareJobUserTemplate(self, jobDir, value, inputType="miniAOD" ):
        '''Prepare one job. This function is called by the base class.'''
@@ -508,7 +563,7 @@ class Component(object):
 if __name__ == '__main__':
     batchManager = MyBatchManager()
     
-    cfgFileName = batchManager.options_.cfgFileName #"analyzer_Run2.py" # This is the python job config. FIXME make it configurable.
+    cfgFileName = batchManager.options_.cfgFileName # This is the python job config.
     sampleCSV  = batchManager.args_[0]            # This is the csv file with samples to be analyzed./
 
     components = []
